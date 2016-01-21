@@ -85,6 +85,7 @@ Audio_Stream::Audio_Stream() :
     m_watchdogTimer(0),
     m_seekTimer(0),
     m_inputStreamTimer(0),
+    m_stateSetTimer(0),
     m_audioFileStream(0),
     m_audioConverter(0),
     m_initializationError(noErr),
@@ -121,6 +122,7 @@ Audio_Stream::Audio_Stream() :
     m_decoderShouldRun(false),
     m_decoderFailed(false),
     m_decoderActive(false),
+    m_mainRunLoop(CFRunLoopGetCurrent()),
     m_decodeRunLoop(NULL)
 {
     memset(&m_srcFormat, 0, sizeof m_srcFormat);
@@ -280,6 +282,15 @@ void Audio_Stream::close(bool closeParser)
         CFRunLoopTimerInvalidate(m_inputStreamTimer);
         CFRelease(m_inputStreamTimer), m_inputStreamTimer = 0;
     }
+    
+    pthread_mutex_lock(&m_streamStateMutex);
+    
+    if (m_stateSetTimer) {
+        CFRunLoopTimerInvalidate(m_stateSetTimer);
+        CFRelease(m_stateSetTimer), m_stateSetTimer = 0;
+    }
+    
+    pthread_mutex_unlock(&m_streamStateMutex);
     
     /* Close the HTTP stream first so that the audio stream parser
        isn't fed with more data to parse */
@@ -733,7 +744,6 @@ void Audio_Stream::audioQueueStateChanged(Audio_Queue::State state)
 {
     if (state == Audio_Queue::RUNNING) {
         invalidateWatchdogTimer();
-        setState(PLAYING);
         
         float currentVolume = m_audioQueue->volume();
         
@@ -1399,6 +1409,22 @@ void Audio_Stream::seekTimerCallback(CFRunLoopTimerRef timer, void *info)
         if (success) {
             THIS->setContentLength(THIS->m_originalContentLength);
             
+            pthread_mutex_lock(&THIS->m_streamStateMutex);
+            
+            if (THIS->m_audioConverter) {
+                AudioConverterDispose(THIS->m_audioConverter);
+            }
+            OSStatus err = AudioConverterNew(&(THIS->m_srcFormat),
+                                             &(THIS->m_dstFormat),
+                                             &(THIS->m_audioConverter));
+            if (err) {
+                THIS->closeAndSignalError(AS_ERR_OPEN, CFSTR("Error in creating an audio converter"));
+                pthread_mutex_unlock(&THIS->m_streamStateMutex);
+                return;
+            }
+            
+            pthread_mutex_unlock(&THIS->m_streamStateMutex);
+            
             THIS->setState(BUFFERING);
             
             THIS->m_inputStreamRunning = true;
@@ -1453,6 +1479,22 @@ void Audio_Stream::inputStreamTimerCallback(CFRunLoopTimerRef timer, void *info)
     } else {
         pthread_mutex_unlock(&THIS->m_packetQueueMutex);
     }
+}
+    
+void Audio_Stream::stateSetTimerCallback(CFRunLoopTimerRef timer, void *info)
+{
+    Audio_Stream *THIS = (Audio_Stream *)info;
+    
+    pthread_mutex_lock(&THIS->m_streamStateMutex);
+    
+    if (THIS->m_stateSetTimer) {
+        // Timer is automatically invalidated as it fires only once
+        CFRelease(THIS->m_stateSetTimer), THIS->m_stateSetTimer = 0;
+    }
+    
+    pthread_mutex_unlock(&THIS->m_streamStateMutex);
+    
+    THIS->setState(PLAYING);
 }
     
 bool Audio_Stream::decoderShouldRun()
@@ -1575,6 +1617,18 @@ void Audio_Stream::decodeSinglePacket(CFRunLoopTimerRef timer, void *info)
     if (err == noErr && THIS->m_decoderShouldRun) {
         THIS->m_audioQueueConsumedPackets = true;
         
+        if (THIS->m_state != PLAYING && !THIS->m_stateSetTimer) {
+            // Set the playing state in the main thread
+
+            CFRunLoopTimerContext ctx = {0, THIS, NULL, NULL, NULL};
+            
+            THIS->m_stateSetTimer = CFRunLoopTimerCreate(NULL, 0, 0, 0, 0,
+                                                         stateSetTimerCallback,
+                                                         &ctx);
+            
+            CFRunLoopAddTimer(THIS->m_mainRunLoop, THIS->m_stateSetTimer, kCFRunLoopCommonModes);
+        }
+        
         pthread_mutex_unlock(&THIS->m_streamStateMutex);
         
         // This blocks until the queue has been able to consume the packets
@@ -1637,8 +1691,6 @@ void *Audio_Stream::decodeLoop(void *data)
     
     pthread_mutex_unlock(&THIS->m_streamStateMutex);
     
-    // Set up a timer ticking once every 40ms to
-    // run the decoder
     CFRunLoopTimerContext ctx;
     ctx.version = 0;
     ctx.info = data;
@@ -1647,8 +1699,8 @@ void *Audio_Stream::decodeLoop(void *data)
     ctx.copyDescription = NULL;
     CFRunLoopTimerRef timer =
     CFRunLoopTimerCreate (NULL,
-                          CFAbsoluteTimeGetCurrent() + 0.04,
-                          0.04,
+                          CFAbsoluteTimeGetCurrent() + 0.02, // 20ms
+                          0.02,
                           0,
                           0,
                           decodeSinglePacket,
@@ -1762,6 +1814,24 @@ void Audio_Stream::determineBufferingLimits()
         // Check if we have enough prebuffered data to start playback
         
         AS_TRACE("initial buffering not completed, checking if enough data\n");
+        
+        if (config->usePrebufferSizeCalculationInPackets) {
+            const int packetCount = cachedDataCount();
+            
+            if (packetCount >= config->requiredInitialPrebufferedPacketCount) {
+                AS_TRACE("More than %i packets prebuffered, required %i packets. Playback can be started\n",
+                         packetCount,
+                         config->requiredInitialPrebufferedPacketCount);
+                
+                m_initialBufferingCompleted = true;
+                
+                pthread_mutex_lock(&m_streamStateMutex);
+                m_decoderShouldRun = true;
+                pthread_mutex_unlock(&m_streamStateMutex);
+                
+                return;
+            }
+        }
         
         int lim;
         
